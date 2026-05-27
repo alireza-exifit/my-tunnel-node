@@ -1,0 +1,566 @@
+name: "multi-proxy-exit-node"
+
+on:
+  workflow_dispatch:
+    inputs:
+      vpn_enabled:
+        description: 'Route all traffic through WireGuard VPN (requires WG_CONFIG secret)'
+        type: boolean
+        default: false
+
+jobs:
+  proxy-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------- WireGuard (optional) --------------------
+      - name: "🔒 Set up WireGuard VPN (if enabled)"
+        id: vpn
+        run: |
+          VPN_ENABLED="${{ inputs.vpn_enabled }}"
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ -z "${{ secrets.WG_CONFIG }}" ]; then
+            echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "→ Installing WireGuard tools..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || \
+            sudo apt-get install -y -qq wireguard-tools
+
+          echo "→ Writing WireGuard config..."
+          cat <<'EOF' > /tmp/wg0.conf
+          ${{ secrets.WG_CONFIG }}
+          EOF
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      # -------------------- Download tools --------------------
+      - name: "📥 Download tools (cloudflared, mtg, xray)"
+        run: |
+          echo "→ cloudflared"
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+          echo "→ mtg (MTProto proxy)"
+          curl -fsSL https://github.com/9seconds/mtg/releases/latest/download/mtg-linux-amd64 -o mtg
+          chmod +x mtg
+
+          echo "→ Xray-core"
+          curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
+          unzip -q xray.zip -d xray_dir
+          mv xray_dir/xray xray
+          chmod +x xray
+          rm -rf xray.zip xray_dir
+
+      # -------------------- Proxy scripts --------------------
+      - name: "🐍 Write SOCKS5 & HTTP proxy scripts"
+        run: |
+          cat <<'PYEOF' > socks5_proxy.py
+          import asyncio, socket, struct, os, sys
+
+          SOCKS_VERSION = 5
+          USER = os.environ.get("SOCKS5_USER", "user")
+          PASS = os.environ.get("SOCKS5_PASS", "pass")
+
+          async def exchange(reader, writer, data):
+              writer.write(data)
+              await writer.drain()
+              return await reader.readexactly(len(data))
+
+          async def socks_auth(reader, writer):
+              ver, nmethods = struct.unpack("!BB", await reader.readexactly(2))
+              methods = await reader.readexactly(nmethods)
+              if 2 not in methods:
+                  writer.write(b"\x05\xff")
+                  await writer.drain()
+                  return False
+              await exchange(reader, writer, b"\x05\x02")
+              ver, ulen = struct.unpack("!BB", await reader.readexactly(2))
+              username = (await reader.readexactly(ulen)).decode()
+              plen = struct.unpack("!B", await reader.readexactly(1))[0]
+              password = (await reader.readexactly(plen)).decode()
+              if username == USER and password == PASS:
+                  writer.write(b"\x01\x00")
+                  await writer.drain()
+                  return True
+              writer.write(b"\x01\x01")
+              await writer.drain()
+              return False
+
+          async def handle_client(reader, writer):
+              try:
+                  ver = await reader.readexactly(1)
+                  if ver != b"\x05":
+                      writer.close()
+                      return
+                  if not await socks_auth(reader, writer):
+                      writer.close()
+                      return
+                  ver, cmd, rsv, atyp = struct.unpack("!BBBB", await reader.readexactly(4))
+                  if cmd != 1:  # CONNECT only
+                      writer.write(b"\x05\x07\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+                      await writer.drain()
+                      writer.close()
+                      return
+                  if atyp == 1:
+                      host = socket.inet_ntoa(await reader.readexactly(4))
+                  elif atyp == 3:
+                      length = struct.unpack("!B", await reader.readexactly(1))[0]
+                      host = (await reader.readexactly(length)).decode()
+                  elif atyp == 4:
+                      host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
+                  else:
+                      writer.close()
+                      return
+                  port = struct.unpack("!H", await reader.readexactly(2))[0]
+                  try:
+                      remote_reader, remote_writer = await asyncio.open_connection(host, port)
+                  except Exception as e:
+                      writer.write(b"\x05\x04\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+                      await writer.drain()
+                      writer.close()
+                      return
+                  writer.write(b"\x05\x00\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+                  await writer.drain()
+                  async def pipe(reader, writer):
+                      try:
+                          while True:
+                              data = await reader.read(4096)
+                              if not data: break
+                              writer.write(data)
+                              await writer.drain()
+                      except:
+                          pass
+                  await asyncio.gather(pipe(reader, remote_writer), pipe(remote_reader, writer))
+                  writer.close()
+              except Exception:
+                  try: writer.close()
+                  except: pass
+
+          async def main():
+              server = await asyncio.start_server(handle_client, "127.0.0.1", 3002)
+              print("SOCKS5 proxy listening on 127.0.0.1:3002")
+              async with server:
+                  await server.serve_forever()
+
+          asyncio.run(main())
+          PYEOF
+
+          cat <<'PYEOF' > http_proxy.py
+          import os, sys
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          from socketserver import ThreadingMixIn
+          import urllib.request, urllib.error
+          import threading
+
+          USER = os.environ.get("HTTP_PROXY_USER", "user")
+          PASS = os.environ.get("HTTP_PROXY_PASS", "pass")
+
+          class AuthHandler(BaseHTTPRequestHandler):
+              def do_AUTHHEAD(self):
+                  self.send_response(407)
+                  self.send_header('Proxy-Authenticate', 'Basic realm="Proxy"')
+                  self.end_headers()
+
+              def authenticate(self):
+                  auth = self.headers.get('Proxy-Authorization')
+                  if not auth:
+                      self.do_AUTHHEAD()
+                      return False
+                  import base64
+                  try:
+                      scheme, creds = auth.split()
+                      if scheme.lower() != 'basic':
+                          self.do_AUTHHEAD()
+                          return False
+                      user_pass = base64.b64decode(creds).decode()
+                      u, p = user_pass.split(':', 1)
+                      if u == USER and p == PASS:
+                          return True
+                  except:
+                      pass
+                  self.do_AUTHHEAD()
+                  return False
+
+              def do_GET(self):
+                  if not self.authenticate(): return
+                  try:
+                      url = self.path
+                      req = urllib.request.Request(url, headers=self.headers)
+                      with urllib.request.urlopen(req) as resp:
+                          self.send_response(resp.status)
+                          for k, v in resp.getheaders():
+                              self.send_header(k, v)
+                          self.end_headers()
+                          self.wfile.write(resp.read())
+                  except Exception as e:
+                      self.send_error(502)
+
+              do_POST = do_GET
+              do_PUT = do_GET
+              do_DELETE = do_GET
+
+              def do_CONNECT(self):
+                  if not self.authenticate(): return
+                  host, port = self.path.split(':')
+                  port = int(port)
+                  try:
+                      s = socket.create_connection((host, port))
+                      self.send_response(200, 'Connection Established')
+                      self.end_headers()
+                      self.connection.setblocking(False)
+                      s.setblocking(False)
+                      import select
+                      while True:
+                          r, _, _ = select.select([self.connection, s], [], [], 30)
+                          if not r: break
+                          if self.connection in r:
+                              data = self.connection.recv(8192)
+                              if not data: break
+                              s.sendall(data)
+                          if s in r:
+                              data = s.recv(8192)
+                              if not data: break
+                              self.connection.sendall(data)
+                  except Exception as e:
+                      self.send_error(502)
+                  finally:
+                      try: s.close()
+                      except: pass
+
+          class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+              daemon_threads = True
+
+          import socket
+          server = ThreadedHTTPServer(('127.0.0.1', 3003), AuthHandler)
+          print("HTTP proxy listening on 127.0.0.1:3003")
+          server.serve_forever()
+          PYEOF
+
+      # -------------------- Xray config generation --------------------
+      - name: "⚙️ Generate Xray configuration"
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+          XRAY_VLESS_PATH: ${{ secrets.XRAY_VLESS_PATH }}
+          XRAY_VMESS_PATH: ${{ secrets.XRAY_VMESS_PATH }}
+          XRAY_TROJAN_PATH: ${{ secrets.XRAY_TROJAN_PATH }}
+          XRAY_TRANSPORT: ${{ secrets.XRAY_TRANSPORT }}
+          TROJAN_PASSWORD: ${{ secrets.TROJAN_PASSWORD }}
+        run: |
+          TRANSPORT="${XRAY_TRANSPORT:-ws}"
+          UUID="${XRAY_UUID:-$(uuidgen)}"
+          VLESS_PATH="${XRAY_VLESS_PATH:-/vless}"
+          VMESS_PATH="${XRAY_VMESS_PATH:-/vmess}"
+          TROJAN_PATH="${XRAY_TROJAN_PATH:-/trojan}"
+          TROJAN_PASS="${TROJAN_PASSWORD:-$UUID}"
+
+          mkdir -p /tmp/xray
+          cat > /tmp/xray/config.json <<XEOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "port": 3004,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [{"id": "$UUID", "level": 0}],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "$TRANSPORT",
+                  "security": "none",
+                  "$TRANSPORT"Settings: {"path": "$VLESS_PATH"}
+                },
+                "tag": "vless-in"
+              },
+              {
+                "port": 3005,
+                "protocol": "vmess",
+                "settings": {
+                  "clients": [{"id": "$UUID", "level": 0, "alterId": 0}]
+                },
+                "streamSettings": {
+                  "network": "$TRANSPORT",
+                  "security": "none",
+                  "$TRANSPORT"Settings: {"path": "$VMESS_PATH"}
+                },
+                "tag": "vmess-in"
+              },
+              {
+                "port": 3006,
+                "protocol": "trojan",
+                "settings": {
+                  "clients": [{"password": "$TROJAN_PASS", "level": 0}]
+                },
+                "streamSettings": {
+                  "network": "$TRANSPORT",
+                  "security": "none",
+                  "$TRANSPORT"Settings: {"path": "$TROJAN_PATH"}
+                },
+                "tag": "trojan-in"
+              }
+            ],
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+          }
+          XEOF
+
+      # -------------------- Start services --------------------
+      - name: "🚀 Start MTProto proxy"
+        env:
+          MT_PROXY_SECRET: ${{ secrets.MT_PROXY_SECRET }}
+        run: |
+          if [ -z "$MT_PROXY_SECRET" ]; then
+            echo "⚠️ MT_PROXY_SECRET not set – skipping MTProto proxy"
+            touch /tmp/mtproto_skip
+          else
+            echo "→ Starting MTProto proxy on 127.0.0.1:3001"
+            ./mtg run -b 127.0.0.1:3001 --secret="$MT_PROXY_SECRET" > /tmp/mtproto.log 2>&1 &
+            echo $! > /tmp/mtproto.pid
+            sleep 1
+            if ! kill -0 $(cat /tmp/mtproto.pid) 2>/dev/null; then
+              echo "❌ MTProto proxy failed to start"
+              cat /tmp/mtproto.log
+            else
+              echo "✅ MTProto proxy running"
+            fi
+          fi
+
+      - name: "🧦 Start SOCKS5 proxy"
+        run: |
+          echo "→ Starting SOCKS5 proxy on 127.0.0.1:3002"
+          python3 socks5_proxy.py > /tmp/socks5.log 2>&1 &
+          echo $! > /tmp/socks5.pid
+          sleep 1
+          if ! kill -0 $(cat /tmp/socks5.pid) 2>/dev/null; then
+            echo "❌ SOCKS5 proxy failed to start"
+            cat /tmp/socks5.log
+          else
+            echo "✅ SOCKS5 proxy running"
+          fi
+
+      - name: "🌐 Start HTTP proxy"
+        run: |
+          echo "→ Starting HTTP proxy on 127.0.0.1:3003"
+          python3 http_proxy.py > /tmp/http_proxy.log 2>&1 &
+          echo $! > /tmp/http_proxy.pid
+          sleep 1
+          if ! kill -0 $(cat /tmp/http_proxy.pid) 2>/dev/null; then
+            echo "❌ HTTP proxy failed to start"
+            cat /tmp/http_proxy.log
+          else
+            echo "✅ HTTP proxy running"
+          fi
+
+      - name: "⚡ Start Xray"
+        run: |
+          echo "→ Starting Xray with config /tmp/xray/config.json"
+          ./xray run -c /tmp/xray/config.json > /tmp/xray.log 2>&1 &
+          echo $! > /tmp/xray.pid
+          sleep 2
+          if ! kill -0 $(cat /tmp/xray.pid) 2>/dev/null; then
+            echo "❌ Xray failed to start"
+            cat /tmp/xray.log
+          else
+            echo "✅ Xray running (VLESS:3004, VMess:3005, Trojan:3006)"
+          fi
+
+      # -------------------- Cloudflare tunnel --------------------
+      - name: "☁️ Set up Cloudflare tunnels"
+        id: tunnels
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CLOUDFLARED_CONFIG: ${{ secrets.CLOUDFLARED_CONFIG }}
+        run: |
+          # Static tunnel (if token + custom config provided)
+          if [ -n "$CF_TUNNEL_TOKEN" ] && [ -n "$CLOUDFLARED_CONFIG" ]; then
+            echo "📋 Using static Cloudflare Tunnel with provided config."
+            echo "$CF_TUNNEL_TOKEN" > /tmp/cf-token.json
+            echo "$CLOUDFLARED_CONFIG" > /tmp/cloudflared-config.yml
+            ./cloudflared tunnel run --config /tmp/cloudflared-config.yml > /tmp/tunnel.log 2>&1 &
+            echo $! > /tmp/cloudflared.pid
+            echo "static_tunnel=true" >> $GITHUB_OUTPUT
+            echo "✅ Static tunnel started"
+            exit 0
+          fi
+
+          # Dynamic tunnels (fallback: each HTTP/WS service gets its own trycloudflare URL)
+          echo "📡 Starting dynamic tunnels (trycloudflare.com) for HTTP/WS services..."
+          > /tmp/tunnel_urls.txt
+
+          start_dynamic() {
+            local name="$1"
+            local port="$2"
+            local log="/tmp/tunnel_${name}.log"
+            ./cloudflared tunnel --url "http://127.0.0.1:${port}" --metrics 127.0.0.1:0 > "$log" 2>&1 &
+            local pid=$!
+            sleep 8
+            local url=$(grep -o 'https://[^ ]*\.trycloudflare\.com' "$log" | head -1)
+            if [ -n "$url" ]; then
+              echo "${name}:${url}" >> /tmp/tunnel_urls.txt
+              echo "  ✅ ${name} → ${url}"
+            else
+              echo "${name}:NONE" >> /tmp/tunnel_urls.txt
+              echo "  ❌ ${name} tunnel failed"
+            fi
+          }
+
+          # Only services that work with HTTP/WS are exposed via dynamic tunnels
+          start_dynamic "http_proxy" 3003
+          start_dynamic "vless" 3004
+          start_dynamic "vmess" 3005
+          start_dynamic "trojan" 3006
+
+          echo "static_tunnel=false" >> $GITHUB_OUTPUT
+          echo "🌐 Dynamic tunnel URLs saved to /tmp/tunnel_urls.txt"
+
+      # -------------------- Wait for stability --------------------
+      - name: "⏳ Wait for services to fully start"
+        run: sleep 5
+
+      # -------------------- Print summary --------------------
+      - name: "📋 Print connection details"
+        run: |
+          echo "=================================================="
+          echo "  🚀 All services are running!"
+          echo "=================================================="
+
+          # Helper function to retrieve dynamic URL
+          get_url() {
+            grep "^$1:" /tmp/tunnel_urls.txt 2>/dev/null | cut -d: -f2-
+          }
+
+          # --- MTProto proxy ---
+          if [ -f /tmp/mtproto.pid ] && kill -0 $(cat /tmp/mtproto.pid) 2>/dev/null; then
+            echo ""
+            echo "🔷 MTProto Proxy:"
+            echo "   Secret   : $MT_PROXY_SECRET"
+            echo "   Local    : 127.0.0.1:3001"
+            echo "   Link     : tg://proxy?server=LOCAL_HOST&port=3001&secret=$MT_PROXY_SECRET"
+            echo "   ⚠️  MTProto cannot be exposed via free HTTP tunnels."
+            echo "   Use a TCP tunnel (e.g., Cloudflare Spectrum) or local access."
+          else
+            echo ""
+            echo "🔷 MTProto Proxy: NOT RUNNING (secret missing or start failed)"
+          fi
+
+          # --- SOCKS5 proxy ---
+          if [ -f /tmp/socks5.pid ] && kill -0 $(cat /tmp/socks5.pid) 2>/dev/null; then
+            echo ""
+            echo "🧦 SOCKS5 Proxy:"
+            echo "   User/Pass: ${SOCKS5_USER:-user} / ${SOCKS5_PASS:-pass}"
+            echo "   Local    : 127.0.0.1:3002"
+            echo "   Link     : socks5://${SOCKS5_USER:-user}:${SOCKS5_PASS:-pass}@LOCAL_HOST:3002"
+            echo "   ⚠️  SOCKS5 cannot be exposed via free HTTP tunnels."
+          else
+            echo ""
+            echo "🧦 SOCKS5 Proxy: NOT RUNNING"
+          fi
+
+          # --- HTTP proxy ---
+          if [ -f /tmp/http_proxy.pid ] && kill -0 $(cat /tmp/http_proxy.pid) 2>/dev/null; then
+            HTTP_URL=$(get_url "http_proxy")
+            echo ""
+            echo "🌐 HTTP Proxy:"
+            echo "   User/Pass: ${HTTP_PROXY_USER:-user} / ${HTTP_PROXY_PASS:-pass}"
+            echo "   Local    : 127.0.0.1:3003"
+            if [ "$HTTP_URL" != "NONE" ] && [ -n "$HTTP_URL" ]; then
+              echo "   Public   : $HTTP_URL"
+              echo "   Link     : http://${HTTP_PROXY_USER:-user}:${HTTP_PROXY_PASS:-pass}@$(echo $HTTP_URL | sed 's~https://~~')"
+            else
+              echo "   Public   : (static tunnel or not exposed)"
+            fi
+          else
+            echo ""
+            echo "🌐 HTTP Proxy: NOT RUNNING"
+          fi
+
+          # --- Xray services (VLESS, VMess, Trojan) ---
+          if [ -f /tmp/xray.pid ] && kill -0 $(cat /tmp/xray.pid) 2>/dev/null; then
+            VLESS_URL=$(get_url "vless")
+            VMESS_URL=$(get_url "vmess")
+            TROJAN_URL=$(get_url "trojan")
+
+            VLESS_HOST=$(echo "$VLESS_URL" | sed 's~https://~~')
+            VMESS_HOST=$(echo "$VMESS_URL" | sed 's~https://~~')
+            TROJAN_HOST=$(echo "$TROJAN_URL" | sed 's~https://~~')
+
+            UUID="${XRAY_UUID:-$(uuidgen)}"
+            VLESS_PATH="${XRAY_VLESS_PATH:-/vless}"
+            VMESS_PATH="${XRAY_VMESS_PATH:-/vmess}"
+            TROJAN_PATH="${XRAY_TROJAN_PATH:-/trojan}"
+            TROJAN_PASS="${TROJAN_PASSWORD:-$UUID}"
+            TRANSPORT="${XRAY_TRANSPORT:-ws}"
+
+            echo ""
+            echo "⚡ Xray (transport: $TRANSPORT):"
+
+            echo ""
+            echo "  🔹 VLESS (port 3004):"
+            echo "     UUID     : $UUID"
+            echo "     Path     : $VLESS_PATH"
+            if [ -n "$VLESS_HOST" ] && [ "$VLESS_HOST" != "NONE" ]; then
+              echo "     Public   : $VLESS_URL"
+              echo "     Link     : vless://${UUID}@${VLESS_HOST}:443?encryption=none&security=tls&type=${TRANSPORT}&path=${VLESS_PATH}&host=${VLESS_HOST}#VLESS-Proxy"
+            else
+              echo "     Public   : (static tunnel or not exposed)"
+            fi
+
+            echo ""
+            echo "  🔹 VMess (port 3005):"
+            echo "     UUID     : $UUID"
+            echo "     Path     : $VMESS_PATH"
+            if [ -n "$VMESS_HOST" ] && [ "$VMESS_HOST" != "NONE" ]; then
+              VMESS_JSON=$(python3 -c "import json, base64; print(base64.b64encode(json.dumps({'v':'2','ps':'VMess-Proxy','add':'$VMESS_HOST','port':'443','id':'$UUID','aid':'0','net':'$TRANSPORT','type':'none','host':'$VMESS_HOST','path':'$VMESS_PATH','tls':'tls'}).encode()).decode())")
+              echo "     Public   : $VMESS_URL"
+              echo "     Link     : vmess://$VMESS_JSON"
+            else
+              echo "     Public   : (static tunnel or not exposed)"
+            fi
+
+            echo ""
+            echo "  🔹 Trojan (port 3006):"
+            echo "     Password : $TROJAN_PASS"
+            echo "     Path     : $TROJAN_PATH"
+            if [ -n "$TROJAN_HOST" ] && [ "$TROJAN_HOST" != "NONE" ]; then
+              echo "     Public   : $TROJAN_URL"
+              echo "     Link     : trojan://${TROJAN_PASS}@${TROJAN_HOST}:443?security=tls&type=${TRANSPORT}&path=${TROJAN_PATH}&host=${TROJAN_HOST}#Trojan-Proxy"
+            else
+              echo "     Public   : (static tunnel or not exposed)"
+            fi
+          else
+            echo ""
+            echo "⚡ Xray: NOT RUNNING"
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "  ⏳ The workflow will now stay alive for 6 hours."
+          echo "=================================================="
+
+      # -------------------- Keep alive (6 hours) --------------------
+      - name: "💤 Keep alive"
+        run: |
+          while true; do
+            sleep 3600
+            echo "[$(date)] All services are still running."
+          done
